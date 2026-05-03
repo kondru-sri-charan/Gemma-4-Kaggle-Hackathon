@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-import types
 from dataclasses import dataclass
 from io import BytesIO
 
@@ -110,7 +108,11 @@ def test_blank_pdf_extracts_no_text_and_analyzes_as_unreadable() -> None:
     analysis = analyze_document(extraction.text, "English")
 
     assert extraction.text == ""
-    assert "No selectable text was found" in extraction.error
+    # Blank PDFs still render a page image (which shows nothing), so the
+    # extractor reports vision mode rather than hard-failing. In mock mode
+    # the analyzer still falls back to the "unreadable" response because
+    # the heuristic analyzer cannot see images.
+    assert extraction.evidence in {"vision", "text"}
     assert analysis["document_type"] == UNREADABLE_DOCUMENT_TYPE
     assert analysis["risk_flags"] == []
 
@@ -123,40 +125,46 @@ def test_extract_document_text_routes_pdf_upload() -> None:
     assert "Salary: Rs 18000" in result.text
 
 
-def test_extract_image_text_uses_pytesseract_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_pytesseract = types.SimpleNamespace(
-        TesseractNotFoundError=RuntimeError,
-        image_to_string=lambda image: "Mock OCR employment text",
-    )
-    monkeypatch.setitem(sys.modules, "pytesseract", fake_pytesseract)
-
-    result = app.extract_image_text(make_png_bytes())
+def test_extract_pdf_text_also_returns_page_images_for_vision_path() -> None:
+    """Hybrid extraction: text AND page images both flow through for PDFs."""
+    result = app.extract_pdf_text(make_pdf_bytes("Employment Offer Letter"))
 
     assert result.error is None
-    assert result.text == "Mock OCR employment text"
+    assert "Employment Offer Letter" in result.text
+    assert result.images, "page images should be rendered for the vision path"
+    assert all(isinstance(img, str) and img for img in result.images)
+    assert result.evidence == "hybrid"
 
 
-def test_extract_image_text_handles_tesseract_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeTesseractNotFoundError(Exception):
-        pass
+def test_extract_image_normalizes_to_png_b64_for_vision() -> None:
+    """Image uploads go straight to the vision path: no OCR, no Tesseract."""
+    result = app.extract_image(make_png_bytes())
 
-    def raise_missing_engine(image: Image.Image) -> str:
-        raise FakeTesseractNotFoundError()
-
-    fake_pytesseract = types.SimpleNamespace(
-        TesseractNotFoundError=FakeTesseractNotFoundError,
-        image_to_string=raise_missing_engine,
-    )
-    monkeypatch.setitem(sys.modules, "pytesseract", fake_pytesseract)
-
-    result = app.extract_image_text(make_png_bytes())
-
+    assert result.error is None
+    assert result.can_analyze is True
     assert result.text == ""
-    assert "Tesseract OCR is not installed" in result.error
+    assert len(result.images) == 1
+    # The base64 is plain (no data URL prefix) so Ollama can accept it as-is.
+    assert not result.images[0].startswith("data:")
+    assert result.evidence == "vision"
 
 
-def test_extract_image_text_handles_invalid_image() -> None:
-    result = app.extract_image_text(b"not an image")
+def test_extract_image_rejects_invalid_bytes() -> None:
+    """Broken image bytes must not crash the pipeline and must be flagged."""
+    result = app.extract_image(b"not an image")
 
     assert result.can_analyze is False
+    assert result.text == ""
+    assert result.images == []
     assert "could not be read" in result.error
+
+
+def test_extract_image_converts_non_rgb_modes_to_png() -> None:
+    """Upload flows may hand us non-RGB images (palette, RGBA); normalize them."""
+    buf = BytesIO()
+    Image.new("RGBA", (20, 20), color=(255, 255, 255, 255)).save(buf, format="PNG")
+    result = app.extract_image(buf.getvalue())
+
+    assert result.error is None
+    assert result.images
+    assert result.evidence == "vision"

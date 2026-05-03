@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import base64
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
@@ -14,13 +15,26 @@ from services.gemma_client import MODEL_MODE_REAL, describe_model_mode, get_gemm
 
 SUPPORTED_LANGUAGES = ["English", "Hindi", "Marathi", "Tamil", "Telugu"]
 SUPPORTED_FILE_TYPES = ["pdf", "png", "jpg", "jpeg"]
+MAX_VISION_PAGES = 4
+VISION_DPI = 144
 
 
 @dataclass(frozen=True)
 class ExtractionResult:
     text: str = ""
+    # Base64-encoded PNG bytes of each page/image. We pass these to Gemma 4
+    # for the hybrid vision path. In mock mode they are ignored.
+    images: list[str] = field(default_factory=list)
+    # Human-readable notes: extraction warnings, empty-text explanations, etc.
+    # Rendered under the extracted-text expander when present.
     error: str | None = None
+    # When False, the UI should not proceed to analysis (truly broken upload).
     can_analyze: bool = True
+    # Label the dominant evidence source so we can tag the UI accordingly.
+    # "text" - selectable text was found
+    # "vision" - no text, model will read the image(s)
+    # "hybrid" - both text and image(s) available
+    evidence: str = "text"
 
 
 def get_file_extension(file_name: str) -> str:
@@ -39,7 +53,33 @@ def classify_uploaded_file(file_name: str, file_type: str) -> str | None:
     return None
 
 
+def _render_pdf_pages_to_png_b64(
+    pdf_document, max_pages: int = MAX_VISION_PAGES, dpi: int = VISION_DPI
+) -> list[str]:
+    """Rasterize up to ``max_pages`` PDF pages and return them as base64 PNGs.
+
+    PyMuPDF's 72 DPI baseline is tweaked to ``dpi`` for readability at the
+    cost of token budget. 144 DPI gives Gemma 4's vision encoder plenty of
+    resolution on typical offer letters without blowing up latency.
+    """
+    import fitz  # local alias for type checkers
+
+    matrix = fitz.Matrix(dpi / 72, dpi / 72)
+    images: list[str] = []
+    for page in pdf_document[:max_pages]:
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        images.append(base64.b64encode(pix.tobytes("png")).decode("ascii"))
+    return images
+
+
 def extract_pdf_text(file_bytes: bytes) -> ExtractionResult:
+    """Hybrid PDF extraction: pull selectable text AND render page images.
+
+    The text path is fast and works for clean, digitally-generated PDFs. The
+    image path gives Gemma 4 a direct look at the document, which recovers
+    scanned and image-only PDFs without needing Tesseract. Both evidence
+    streams are passed on to the analyzer when real mode is active.
+    """
     try:
         import fitz
     except ImportError:
@@ -48,59 +88,90 @@ def extract_pdf_text(file_bytes: bytes) -> ExtractionResult:
         )
 
     try:
-        page_texts = []
+        page_texts: list[str] = []
+        images: list[str] = []
         with fitz.open(stream=file_bytes, filetype="pdf") as document:
             for page_number, page in enumerate(document, start=1):
                 text = page.get_text("text").strip()
                 if text:
                     page_texts.append(f"Page {page_number}\n{text}")
 
+            # Render page images for the vision path regardless of whether
+            # text extraction found anything. This keeps latency bounded via
+            # MAX_VISION_PAGES while still giving the model something to
+            # look at on scanned or stamped pages.
+            try:
+                images = _render_pdf_pages_to_png_b64(document)
+            except Exception:
+                images = []
+
         extracted_text = "\n\n".join(page_texts).strip()
-        if not extracted_text:
+
+        if not extracted_text and not images:
             return ExtractionResult(
                 error=(
-                    "No selectable text was found in this PDF. It may be scanned; "
-                    "image-based PDF OCR can be added in a later version."
+                    "No selectable text and no renderable pages were found. "
+                    "The file may be empty or corrupted."
                 ),
             )
 
-        return ExtractionResult(text=extracted_text)
+        if not extracted_text:
+            return ExtractionResult(
+                text="",
+                images=images,
+                error=(
+                    "No selectable text was found in this PDF. The AI will read "
+                    "the page images directly (vision mode)."
+                ),
+                evidence="vision",
+            )
+
+        return ExtractionResult(
+            text=extracted_text,
+            images=images,
+            evidence="hybrid" if images else "text",
+        )
     except Exception as exc:
         return ExtractionResult(error=f"Could not extract text from the PDF: {exc}")
 
 
-def extract_image_text(file_bytes: bytes) -> ExtractionResult:
+def _png_b64_from_image_bytes(file_bytes: bytes) -> str | None:
+    """Normalize an uploaded image to a base64-encoded PNG.
+
+    Gemma 4 accepts JPG and PNG, but standardizing on PNG avoids any
+    ambiguity about data URL prefixes and keeps the downstream code simple.
+    """
     try:
-        import pytesseract
-    except ImportError:
-        return ExtractionResult(
-            error="pytesseract is not installed. Run `pip install -r requirements.txt`.",
-        )
+        with Image.open(BytesIO(file_bytes)) as image:
+            if image.mode not in {"RGB", "L"}:
+                image = image.convert("RGB")
+            buf = BytesIO()
+            image.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+    except (UnidentifiedImageError, OSError):
+        return None
 
-    try:
-        image = Image.open(BytesIO(file_bytes))
-        extracted_text = pytesseract.image_to_string(image).strip()
 
-        if not extracted_text:
-            return ExtractionResult(
-                error="No text was detected in this image. Try a clearer scan or photo.",
-            )
+def extract_image(file_bytes: bytes) -> ExtractionResult:
+    """Prepare an image upload for the vision path.
 
-        return ExtractionResult(text=extracted_text)
-    except UnidentifiedImageError:
+    We no longer OCR on the Python side. Gemma 4's vision encoder reads
+    images directly, so we just normalize the upload to PNG and forward it
+    to the analyzer. This drops the hard Tesseract dependency and works on
+    phone photos, scans, and stamped documents.
+    """
+    image_b64 = _png_b64_from_image_bytes(file_bytes)
+    if image_b64 is None:
         return ExtractionResult(
             error="The uploaded image could not be read. Please upload a valid PNG or JPG file.",
             can_analyze=False,
         )
-    except pytesseract.TesseractNotFoundError:
-        return ExtractionResult(
-            error=(
-                "Tesseract OCR is not installed or is not on PATH. "
-                "Install the Tesseract engine to enable image text extraction."
-            ),
-        )
-    except Exception as exc:
-        return ExtractionResult(error=f"Could not extract text from the image: {exc}")
+
+    return ExtractionResult(
+        text="",
+        images=[image_b64],
+        evidence="vision",
+    )
 
 
 def extract_document_text(uploaded_file) -> ExtractionResult:
@@ -120,7 +191,7 @@ def extract_document_text(uploaded_file) -> ExtractionResult:
     if document_kind == "pdf":
         return extract_pdf_text(file_bytes)
 
-    return extract_image_text(file_bytes)
+    return extract_image(file_bytes)
 
 
 def render_list(items: Iterable[str]) -> None:
@@ -184,6 +255,66 @@ def render_analysis_source(source: str) -> None:
     st.caption(f"Analysis source: `{source}`")
 
 
+def render_tool_log(tool_log: list[dict]) -> None:
+    """Surface the labor-law citations Gemma pulled in during analysis.
+
+    This is the "grounded" story: every time the model called
+    lookup_labor_law, we show the statute reference so the user can see
+    their analysis is backed by real law rather than generic guidance.
+    """
+    if not tool_log:
+        return
+
+    with st.container(border=True):
+        st.subheader("Grounded in Indian labor law")
+        st.caption(
+            f"Gemma 4 consulted the labor-law knowledge base {len(tool_log)} "
+            "time(s) to ground this analysis."
+        )
+        for call in tool_log:
+            name = call.get("name", "tool")
+            arguments = call.get("arguments") or {}
+            result = call.get("result")
+            with st.expander(
+                f"{name}({_format_tool_args(arguments)})",
+                expanded=False,
+            ):
+                if isinstance(result, list):
+                    for row in result:
+                        if not isinstance(row, dict):
+                            st.write(row)
+                            continue
+                        st.markdown(
+                            f"**{row.get('title', '')}**  \n"
+                            f"_{row.get('statute_reference', '')}_\n\n"
+                            f"{row.get('summary', '')}"
+                        )
+                elif isinstance(result, dict) and "error" in result:
+                    st.warning(result["error"])
+                else:
+                    st.write(result)
+
+
+def _format_tool_args(arguments: dict) -> str:
+    parts = []
+    for key, value in arguments.items():
+        parts.append(f"{key}={value!r}")
+    return ", ".join(parts)
+
+
+def render_evidence_source(extraction: ExtractionResult, model_config) -> None:
+    """Show a small badge explaining whether text, vision, or both were used."""
+    if model_config.model_mode != MODEL_MODE_REAL:
+        return
+
+    if extraction.evidence == "vision":
+        st.caption("Evidence: vision — Gemma 4 reads the page images directly.")
+    elif extraction.evidence == "hybrid":
+        st.caption("Evidence: text + vision — extracted text plus page images.")
+    else:
+        st.caption("Evidence: text — extracted directly from the document.")
+
+
 def render_extracted_text(result: ExtractionResult) -> None:
     with st.expander("Extracted Document Text", expanded=False):
         if result.error:
@@ -196,6 +327,11 @@ def render_extracted_text(result: ExtractionResult) -> None:
                 height=260,
                 disabled=True,
                 label_visibility="collapsed",
+            )
+        elif result.images and not result.error:
+            st.info(
+                "No selectable text in this document. The analysis will use the "
+                "page image(s) directly."
             )
         elif not result.error:
             st.info("No text was extracted from the document.")
@@ -268,13 +404,28 @@ def main() -> None:
         elif analyze_clicked and uploaded_file is not None:
             extraction = extract_document_text(uploaded_file)
             render_extracted_text(extraction)
+            render_evidence_source(extraction, model_config)
 
             if extraction.can_analyze:
-                analysis_result = analyze_document_with_status(extraction.text, target_language)
+                # In mock mode we ignore images because the heuristic analyzer
+                # cannot see them. In real mode we forward them so Gemma 4 can
+                # read the document directly.
+                images_to_use = (
+                    extraction.images
+                    if model_config.model_mode == MODEL_MODE_REAL
+                    else None
+                )
+                with st.spinner("Analyzing with Gemma 4..."):
+                    analysis_result = analyze_document_with_status(
+                        extraction.text,
+                        target_language,
+                        images=images_to_use,
+                    )
                 render_analysis_source(analysis_result.source)
+                render_tool_log(analysis_result.tool_log)
                 render_analysis_cards(analysis_result.analysis)
         else:
-            st.info("Click Analyze Document to generate a mock explanation.")
+            st.info("Click Analyze Document to generate an explanation.")
 
 
 if __name__ == "__main__":

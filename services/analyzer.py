@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from services.gemma_client import (
     MODEL_MODE_REAL,
+    PROVIDER_OLLAMA,
     GemmaClientError,
     generate_gemma_response,
+    generate_gemma_response_with_tools,
     get_gemma_config,
+)
+from services.labor_law import (
+    execute_tool_call,
+    get_lookup_tool_schema,
 )
 from services.prompt_loader import PromptLoaderError, render_document_analysis_prompt
 
@@ -138,23 +144,73 @@ ANALYSIS_SOURCE_MODEL_FALLBACK = "fallback_after_model_failure"
 class AnalysisResult:
     analysis: DocumentAnalysis
     source: str
+    # Ordered list of tool calls the model made while producing this analysis.
+    # Each entry is ``{"name": str, "arguments": dict, "result": object}``.
+    # Empty for the mock path, the plain-text real path, and any path that
+    # didn't use function calling. The UI reads this to show a "grounded in
+    # these citations" badge with expandable statute references.
+    tool_log: list[dict] = field(default_factory=list)
 
 
 class ModelResponseError(RuntimeError):
     """Raised when a model response is not strict valid analysis JSON."""
 
 
-def analyze_document(extracted_text: str, target_language: str) -> DocumentAnalysis:
-    """Build a validated analysis result using mock mode or a real Gemma provider."""
-    return analyze_document_with_status(extracted_text, target_language).analysis
+def analyze_document(
+    extracted_text: str,
+    target_language: str,
+    images: list[str] | None = None,
+) -> DocumentAnalysis:
+    """Build a validated analysis result using mock mode or a real Gemma provider.
+
+    Args:
+        extracted_text: Document text pulled out of the upload, if any.
+        target_language: Target language for local_language_summary.
+        images: Optional base64-encoded page images. When provided, we let
+            Gemma 4 read them directly (hybrid vision path). Ignored in mock
+            mode.
+    """
+    return analyze_document_with_status(
+        extracted_text, target_language, images=images
+    ).analysis
 
 
-def analyze_document_with_status(extracted_text: str, target_language: str) -> AnalysisResult:
-    """Build a validated analysis result with a UI-safe source label."""
+def analyze_document_with_status(
+    extracted_text: str,
+    target_language: str,
+    images: list[str] | None = None,
+    use_tools: bool | None = None,
+) -> AnalysisResult:
+    """Build a validated analysis result with a UI-safe source label.
+
+    Args:
+        extracted_text: Text pulled out of the upload (may be empty for
+            scanned docs).
+        target_language: Target language for local_language_summary.
+        images: Optional base64 page images (hybrid/vision path).
+        use_tools: Tri-state. ``True`` forces the tool-calling loop (errors
+            if the provider doesn't support it). ``False`` forces the
+            single-shot path. ``None`` (default) auto-enables tools when
+            running real mode against the local Ollama provider, which is
+            the only path currently wired for function calling.
+    """
     config = get_gemma_config()
 
+    if use_tools is None:
+        use_tools = (
+            config.model_mode == MODEL_MODE_REAL
+            and config.provider == PROVIDER_OLLAMA
+        )
+
+    # When we have images, we frame the prompt so the model knows to look at
+    # them even if the extracted text is short or missing. The mock analyzer
+    # path still relies on the plain extracted text.
+    prompt_text = extracted_text
+    if images and config.model_mode == MODEL_MODE_REAL:
+        prompt_text = _build_vision_aware_text(extracted_text)
+
     try:
-        prompt = render_document_analysis_prompt(extracted_text, target_language)
+        prompt = render_document_analysis_prompt(prompt_text, target_language)
     except (PromptLoaderError, Exception) as exc:
         source = (
             ANALYSIS_SOURCE_MODEL_FALLBACK
@@ -168,26 +224,67 @@ def analyze_document_with_status(extracted_text: str, target_language: str) -> A
                 reason=str(exc),
             ),
             source=source,
+            tool_log=[],
         )
 
     if config.model_mode != MODEL_MODE_REAL:
         return AnalysisResult(
             analysis=build_safe_analyzer_response(extracted_text, target_language),
             source=ANALYSIS_SOURCE_MOCK,
+            tool_log=[],
         )
 
     try:
-        model_response = generate_gemma_response(prompt, config)
+        if use_tools:
+            model_response, tool_log = generate_gemma_response_with_tools(
+                prompt=prompt,
+                tools=[get_lookup_tool_schema()],
+                execute_tool=execute_tool_call,
+                config=config,
+                images=images,
+            )
+        else:
+            model_response = generate_gemma_response(prompt, config, images=images)
+            tool_log = []
         analysis = parse_model_json_response(model_response)
+        validated = validate_strict_analysis_or_raise(analysis)
+        validated = _coerce_offscope_classification(validated)
         return AnalysisResult(
-            analysis=validate_strict_analysis_or_raise(analysis),
+            analysis=validated,
             source=ANALYSIS_SOURCE_GEMMA_REAL,
+            tool_log=tool_log,
         )
     except (GemmaClientError, ModelResponseError, Exception):
         return AnalysisResult(
             analysis=build_safe_analyzer_response(extracted_text, target_language),
             source=ANALYSIS_SOURCE_MODEL_FALLBACK,
+            tool_log=[],
         )
+
+
+_VISION_NOTICE_PREFIX = (
+    "The document was provided to you as image(s) attached to this message. "
+    "Read the image(s) directly to extract all fields you need for your analysis."
+)
+
+
+def _build_vision_aware_text(extracted_text: str) -> str:
+    """Wrap the extracted text with a short notice that images are attached.
+
+    If the text extractor found nothing (scanned PDF, photo, OCR unavailable)
+    we send the notice alone so the model relies on vision. If the extractor
+    did find text, we include both so the model can cross-reference.
+    """
+    text = (extracted_text or "").strip()
+    if not text:
+        return _VISION_NOTICE_PREFIX
+
+    return (
+        f"{_VISION_NOTICE_PREFIX}\n"
+        "The following machine-extracted text is also provided as a hint but may be "
+        "incomplete or noisy. Prefer the image when they disagree.\n\n"
+        f"{text}"
+    )
 
 
 def build_safe_analyzer_response(extracted_text: str, target_language: str) -> DocumentAnalysis:
@@ -202,10 +299,22 @@ def build_safe_analyzer_response(extracted_text: str, target_language: str) -> D
         )
 
 
+_CODE_FENCE_PATTERN = re.compile(
+    r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?```\s*$", re.DOTALL
+)
+
+
 def parse_model_json_response(raw_response: str) -> DocumentAnalysis:
     stripped = (raw_response or "").strip()
     if not stripped:
         raise ModelResponseError("Model returned an empty response.")
+
+    # Some tool-calling turns return the JSON inside a ```json ... ``` fence
+    # even though the system prompt forbids it. Strip exactly that wrapper
+    # and nothing else -- arbitrary prose still fails the next check.
+    fence_match = _CODE_FENCE_PATTERN.match(stripped)
+    if fence_match:
+        stripped = fence_match.group(1).strip()
 
     if not stripped.startswith("{") or not stripped.endswith("}"):
         raise ModelResponseError("Model response contained text outside the JSON object.")
@@ -227,6 +336,73 @@ def validate_strict_analysis_or_raise(analysis: DocumentAnalysis) -> DocumentAna
         raise ModelResponseError("; ".join(errors))
 
     return {field: analysis[field] for field in REQUIRED_FIELDS}
+
+
+# Keywords that legitimise an employment-related document_type coming back from
+# the model. If the model returns zero risk_flags AND its document_type string
+# does not contain any of these markers, we treat the document as off-scope
+# and coerce the header to the canonical UNSUPPORTED label while preserving
+# the model's descriptive explanation so the user still knows what they
+# uploaded.
+_EMPLOYMENT_DOCUMENT_TYPE_KEYWORDS = (
+    "employment",
+    "employee",
+    "offer letter",
+    "appointment",
+    "payslip",
+    "pay slip",
+    "salary slip",
+    "wage",
+    "contract",
+    "termination",
+    "separation",
+    "relieving",
+    "probation",
+    "service agreement",
+    "worker",
+    "labour",
+    "labor",
+    # Canonical headers we generate ourselves:
+    UNSUPPORTED_DOCUMENT_TYPE.lower(),
+    UNREADABLE_DOCUMENT_TYPE.lower(),
+)
+
+_UNSUPPORTED_NEXT_ACTION = "Upload an employment-related document for a useful analysis."
+
+
+def _coerce_offscope_classification(analysis: DocumentAnalysis) -> DocumentAnalysis:
+    """Normalise off-scope classifications to the canonical UNSUPPORTED shape.
+
+    The system prompt tells Gemma to return ``document_type ==
+    "Unsupported / Non-employment document"`` when the upload is not an
+    employment document, but the model often picks a more descriptive label
+    instead (for example ``"Health Insurance Benefit Card"``). When that
+    happens alongside an empty risk_flags list, we coerce the header to the
+    canonical string so downstream UI code can rely on it, while keeping the
+    model's useful description in ``simple_explanation`` and
+    ``local_language_summary`` so the user still learns what they uploaded.
+
+    This is deliberately conservative: we only coerce when there are no risk
+    flags, to avoid clobbering a legitimate employment-doc analysis that
+    happens to use an unusual document_type label.
+    """
+    if analysis.get("risk_flags"):
+        return analysis
+
+    document_type = (analysis.get("document_type") or "").lower()
+    if any(keyword in document_type for keyword in _EMPLOYMENT_DOCUMENT_TYPE_KEYWORDS):
+        return analysis
+
+    # Off-scope, no fabricated risks. Canonicalise the classification but
+    # preserve the model's explanation of what the document actually is.
+    coerced = dict(analysis)
+    coerced["document_type"] = UNSUPPORTED_DOCUMENT_TYPE
+    coerced["confidence_level"] = "Low"
+    coerced["next_actions"] = [_UNSUPPORTED_NEXT_ACTION]
+    # Questions and source refs are less useful for an off-scope doc; keep
+    # them only if the model populated them, otherwise clear for cleanliness.
+    coerced.setdefault("questions_to_ask", [])
+    return coerced
 
 
 def build_mock_model_response(extracted_text: str, target_language: str) -> DocumentAnalysis:

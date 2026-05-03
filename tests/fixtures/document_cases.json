@@ -4,7 +4,7 @@
     "category": "positive",
     "target_language": "Hindi",
     "expected_supported": true,
-    "text": "Offer Letter\nEmployee Name: Ravi Kumar\nEmployer: Sunrise Facility Services\nDesignation: Housekeeping Associate\nJoining Date: 01 June 2026\nSalary: Rs 18000 per month\nWorking hours: 9 hours per day, 6 days per week\nLeave: 12 paid leaves per year\nNotice period: 30 days"
+    "text": "Offer Letter\nEmployee Name: Ravi Kumar\nEmployer: Bluemango Facility Solutions\nDesignation: Housekeeping Associate\nJoining Date: 01 June 2026\nSalary: Rs 18000 per month\nWorking hours: 9 hours per day, 6 days per week\nLeave: 12 paid leaves per year\nNotice period: 30 days"
   },
   {
     "id": "positive_appointment_probation",

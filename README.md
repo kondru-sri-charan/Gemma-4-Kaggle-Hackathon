@@ -1,73 +1,107 @@
-# Sahaayak AI Gemma 4 Document Analysis MVP
+# Sahaayak AI — A Gemma 4 powered employment document explainer
 
-Sahaayak AI helps workers understand employment documents in simple, structured language. Upload a PDF or image employment document, and get a practical explanation with risks, next steps, questions to ask, and source references—available in English, Hindi, Marathi, Tamil, or Telugu.
+Sahaayak AI helps Indian workers understand employment documents in simple, structured language. Upload a PDF or image of an offer letter, contract, or payslip and get a practical explanation with risk flags, suggested next steps, questions to ask, and a local language summary in English, Hindi, Marathi, Tamil, or Telugu.
 
----
-
-## Problem Statement
-
-Workers often struggle to understand employment documents due to legal jargon and complex terms. They need:
-- **Simple explanations** of what a document means
-- **Risk identification** to spot unfavorable clauses
-- **Guidance on next steps** before signing
-- **Multi-language support** for accessibility
-- **Trust** that the analysis is safe and transparent
+Built for the [Gemma 4 Good Hackathon](https://kaggle.com/competitions/gemma-4-good-hackathon).
 
 ---
 
-## Target User
+## The problem
 
-- **Primary:** Workers in India reviewing offer letters, employment contracts, payslips, and termination letters
-- **Secondary:** HR professionals, labor consultants, or organizations supporting worker rights
+Every year, millions of workers in India sign employment documents they do not fully understand. Bond clauses, liquidated damages, unexplained salary deductions, and unclear notice-period terms can cost a worker months of wages. Most of these documents are in English, use legal language, and are reviewed on a cheap phone over an unreliable internet connection.
 
----
+Worker-facing advisors — NGOs, labour unions, and legal aid volunteers — exist, but they cannot be everywhere. A model that runs locally, privately, and in the worker's own language can be.
 
-## Why Gemma 4
+## The approach
 
-Gemma 4 (31B parameters) is chosen for this task because:
-- **Open model** - no vendor lock-in, can be deployed on-premise or via API
-- **Multilingual** - supports 40+ languages including Hindi, Tamil, Telugu, Marathi
-- **Strong reasoning** - handles nuanced employment document analysis
-- **Safety** - structured output validation ensures reliable schema adherence
-- **Accessible** - available via Hugging Face Router API with affordable pricing
+Sahaayak uses **Gemma 4** to act as a patient, plain-language explainer. The design is deliberately offline-capable and privacy-first:
 
----
+- **Local inference via Ollama** is the default path. No document content leaves the machine.
+- **Gemma 4 E4B** is the primary model. It is multimodal, supports 140+ languages out of the box, and runs comfortably on a modern laptop, making "community booth" deployments realistic.
+- **Hybrid text + vision extraction.** Clean PDFs go through fast PyMuPDF text extraction. Scanned PDFs, phone photos, and images go through Gemma 4's native vision encoder — no OCR engine needed. Mixed documents get both evidence streams and let Gemma cross-reference.
+- **Grounded in Indian labor law via function calling.** A small local SQLite knowledge base ships with curated entries on bond clauses, notice periods, working hours, minimum wage, and more. Gemma 4 uses its native function calling to consult this database during analysis, so risk flags cite actual statutes (Industrial Employment Standing Orders Act, Indian Contract Act Section 27, Factories Act Section 59, etc.) rather than generic advice.
+- A **heuristic mock analyser** ships alongside the real model and acts as a safe fallback when anything about the real-mode pipeline fails (network blip, invalid JSON, schema violation, provider offline). The app never shows a broken result.
+- **Strict JSON schema validation** on every model response. If the model deviates from the contract, we fall back to the mock analyser and label the source as `fallback_after_model_failure` in the UI.
 
 ## Architecture
 
 ```
-User Upload (PDF/Image)
-        ↓
-    [Text Extraction]
-    PyMuPDF (PDF) / pytesseract (OCR)
-        ↓
-    [Prompt Rendering]
-    Target language + extracted text → LLM prompt
-        ↓
-    [Model Modes]
-    ├─ Mock: Local heuristic analyzer (always works)
-    └─ Real: Gemma 4 via HF Router API
-        ↓
-    [Strict Validation]
-    Parse JSON → Validate schema → Fall back to mock if invalid
-        ↓
-    [UI Rendering]
-    Streamlit cards: Document Type, Risks, Key Points, etc.
+          +------------------------+
+          |  Uploaded document     |
+          |  (PDF, PNG, JPG)       |
+          +-----------+------------+
+                      |
+                      v
+          +-------------------------------+
+          |  Hybrid extractor             |
+          |  - PyMuPDF text (PDF)         |
+          |  - Page images as base64 PNG  |
+          |    (for the vision path)      |
+          |  - Image uploads -> vision    |
+          +-----------+-------------------+
+                      |
+                      v
+          +------------------------+
+          |  Prompt renderer       |
+          |  services/prompt_loader
+          +-----------+------------+
+                      |
+                      v
+     +----------------+----------------+
+     |                                 |
+     v                                 v
++---------+                   +---------------------+
+| Mock    |                   | Gemma 4 client      |
+| analyser|                   |                     |
+| (always |                   | - Ollama: multi-    |
+| works)  |                   |   turn tool loop    |
+|         |                   |   with              |
+|         |                   |   lookup_labor_law  |
+|         |                   | - HF Router: single-|
+|         |                   |   shot (no tools)   |
++----+----+                   +----------+----------+
+     |                                   |
+     |                                   v
+     |                          +---------------------+
+     |                          | Indian labor-law DB |
+     |                          | services/labor_law  |
+     |                          | (SQLite, seeded)    |
+     |                          +----------+----------+
+     |                                   |
+     |                                   v
+     |                          +---------------------+
+     |                          | Strict JSON parse + |
+     |                          | schema validation   |
+     |                          +----+----------+-----+
+     |                               |          | fail
+     |                               | pass     v
+     |                               |     (fallback)
+     v                               v
++-----------------------------------------+
+|  Validated DocumentAnalysis + tool_log  |
+|  document_type, risks, key points,      |
+|  next actions, questions, references,   |
+|  local language summary, confidence,    |
+|  [law citations Gemma consulted]        |
++---------------------+-------------------+
+                      |
+                      v
+          +-----------------------+
+          |  Streamlit card UI    |
+          +-----------------------+
 ```
 
-### Key Components
+### Key components
 
-- **app.py** – Streamlit frontend with file upload, language selection, extracted text preview
-- **services/analyzer.py** – Core analysis engine with mock heuristic fallback
-- **services/gemma_client.py** – OpenAI-compatible API client for Gemma 4
-- **services/prompt_loader.py** – Template rendering with placeholder substitution
-- **prompts/document_analysis_prompt.txt** – System prompt defining output schema and rules
+- `app.py` — Streamlit frontend: upload, extraction preview, analysis cards.
+- `services/analyzer.py` — orchestrates mock and real modes, validates every response, degrades gracefully.
+- `services/gemma_client.py` — talks to Gemma 4 via either local Ollama (`/api/chat`) or an OpenAI-compatible HTTP endpoint.
+- `services/prompt_loader.py` — renders the prompt template with the extracted text and target language.
+- `prompts/document_analysis_prompt.txt` — the strict-JSON contract Gemma 4 is asked to fulfil.
 
----
+## Output schema
 
-## Output Schema
-
-The analyzer returns a structured JSON with 9 fields:
+Every analysis — real, mock, or fallback — returns the same validated shape.
 
 ```json
 {
@@ -91,392 +125,162 @@ The analyzer returns a structured JSON with 9 fields:
 }
 ```
 
----
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
 - Python 3.10+
-- pip or conda
+- [Ollama](https://ollama.com) (for local Gemma 4 inference)
 
-### Installation
+### Install
 
 ```bash
-git clone https://github.com/yourusername/Sahaayak-AI-Gemma4.git
-cd Sahaayak-AI-Gemma4
+git clone <repo>
+cd Gemma-4-Kaggle-Hackathon
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # macOS/Linux
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 ```
 
----
+### Run in mock mode (no model required)
 
-## Running the App
-
-### Mock Mode (Default - No API Required)
-
-Mock mode uses a tested local heuristic analyzer. Perfect for testing and development.
-
-**Windows (PowerShell):**
-```powershell
-$env:MODEL_MODE="mock"
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-**macOS/Linux:**
 ```bash
-export MODEL_MODE="mock"
+export MODEL_MODE=mock
 streamlit run app.py
 ```
 
-The app will open at `http://localhost:8501`. Upload a PDF or image, select your language, and click **Analyze Document**.
+Mock mode runs the deterministic heuristic analyser. It is the safe default and useful for development, CI, and demos where you want to show the UX without running a model.
 
-### Real Mode (Gemma 4 via Hugging Face Router)
+### Run with local Gemma 4 via Ollama
 
-Real mode calls Gemma 4 through the OpenAI-compatible Hugging Face Router API. Still uses mock analyzer as a safe fallback if the model fails.
-
-**Prerequisites:**
-- Hugging Face API token: [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-
-**Windows (PowerShell):**
-```powershell
-$env:MODEL_MODE="real"
-$env:GEMMA_PROVIDER="api"
-$env:GEMMA_MODEL="google/gemma-4-31B-it:novita"
-$env:GEMMA_API_BASE_URL="https://router.huggingface.co/v1"
-$env:HF_TOKEN="hf_your_token_here"
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-**macOS/Linux:**
 ```bash
-export MODEL_MODE="real"
-export GEMMA_PROVIDER="api"
-export GEMMA_MODEL="google/gemma-4-31B-it:novita"
-export GEMMA_API_BASE_URL="https://router.huggingface.co/v1"
-export HF_TOKEN="hf_your_token_here"
+ollama pull gemma4:e4b
+ollama serve                      # only if not already running
+
+export MODEL_MODE=real            # provider defaults to "ollama"
+export GEMMA_MODEL=gemma4:e4b     # default, set only to override
 streamlit run app.py
 ```
 
-The sidebar will show `Model mode: real (api: google/gemma-4-31B-it:novita)` in green when connected.
+The sidebar will show `Model mode: real (ollama: gemma4:e4b)` in green when connected. The analysis source label will read `gemma_real` when a response passes validation, or `fallback_after_model_failure` if anything along the path fails.
 
-**Note:** Never commit `HF_TOKEN` to version control. Use environment variables or a `.env` file (excluded in `.gitignore`).
+### Run with a hosted Gemma 4 endpoint (Hugging Face Router)
 
----
-
-## Testing
-
-Run the comprehensive test suite:
+Optional. Useful if you want to demonstrate the same code against a cloud-hosted Gemma 4.
 
 ```bash
-.venv\Scripts\python.exe -m pytest -q
+export MODEL_MODE=real
+export GEMMA_PROVIDER=api
+export GEMMA_MODEL=google/gemma-4-e4b-it
+export GEMMA_API_BASE_URL=https://router.huggingface.co/v1
+export HF_TOKEN=hf_your_token
+streamlit run app.py
 ```
 
-**Test Coverage:**
-- Schema validation and strict JSON parsing
-- Employment vs. unsupported document classification
-- Statutory deduction handling (PF, TDS, ESI as key points, not risks)
-- Risk flag detection (bond clauses, penalties, long hours, etc.)
-- PDF and image text extraction
-- Mock and real model mode switching
-- Safe fallback on model failure
-- Parametrized corpus tests (positive, negative, gibberish, canary documents)
+Never commit `HF_TOKEN` or any other credential.
 
----
+## Tests
 
-## Safety Features
-
-### Untrusted Input & Strict Output Validation
-
-**The app treats uploaded document text as untrusted input and validates all model responses through a strict JSON schema before rendering.**
-
-This is the core safety mechanism:
-1. **Input** - Document text is extracted but treated as potentially malicious
-2. **Prompt** - System prompt instructs Gemma to return only strict JSON (no markdown, code fences, or extra text)
-3. **Parsing** - Model response must be valid JSON starting with `{` and ending with `}`
-4. **Validation** - Response must match the 9-field schema exactly with correct field types
-5. **Fallback** - If validation fails, the app falls back to the tested mock analyzer with low confidence
-
-### Additional Protections
-
-- **No PII in prompts** - Employee names and IDs from extracted text are not added to the prompt
-- **Statutory deduction awareness** - PF, ESI, TDS, Professional Tax are never flagged as risks
-- **Confidence levels** - Low confidence on fallback, mock mode, or unreadable documents
-- **Source transparency** - Sidebar shows which analyzer generated the result (`mock_analyzer`, `gemma_real`, or `fallback_after_model_failure`)
-- **No secret exposure** - API keys, base URLs, and provider details are never displayed to the user
-
----
-
-## Sample Documents
-
-Three anonymized demo documents are included in `sample_docs/`:
-
-- **employment_agreement_bond_clause.pdf** – Employment contract with restrictive bond clause (tests high-risk detection)
-- **salary_slip_deductions.pdf** – Payslip with statutory deductions (tests PF/TDS/ESI as key points)
-- **non_employment_aws_sample.pdf** – AWS EC2 documentation (tests unsupported document classification)
-
-Generate them with:
 ```bash
+pytest -q
+```
+
+The suite covers:
+
+- Schema validation, including risk-flag object structure.
+- Strict JSON parsing (rejects extra text, markdown, or non-object responses).
+- Employment vs non-employment classification.
+- Statutory deductions (PF, ESI, TDS) handled as key points, not high-risk flags.
+- High-risk deduction detection (penalty, bond recovery, damages).
+- Long-working-hours, overtime, notice-period, and restrictive-clause detection.
+- PDF text extraction, image OCR, unsupported and empty uploads.
+- Mock and real model mode switching.
+- Real-mode fallback on provider error, malformed JSON, extra text, and schema violation.
+- Parametrised corpus tests across positive, negative, gibberish, unreadable, and canary documents (prompt injection, schema subversion attempts).
+
+## Sample documents
+
+Six anonymised sample documents live in `sample_docs/`:
+
+- `employment_agreement_bond_clause.pdf` — contract with a restrictive bond clause (exercises high-risk detection and bond-clause law lookup).
+- `salary_slip_deductions.pdf` — payslip with statutory deductions (exercises PF/TDS/ESI as key points, not risk flags).
+- `non_employment_aws_sample.pdf` — AWS documentation (exercises unsupported-document classification).
+- `hindi_english_offer_letter.pdf` — housekeeping offer letter with a worker-facing Hindi summary. Demonstrates Gemma 4's multilingual output on genuinely mixed-script Indian documents.
+- `gig_worker_agreement.pdf` — delivery-platform contractor agreement with penalty schedule, non-compete, and device deposit (exercises the penalty/damages law lookup and independent-contractor analysis).
+- `karnataka_factory_offer_letter.pdf` — factory worker appointment letter in Karnataka (triggers the Karnataka-specific labor-law lookups under the Karnataka Shops & Commercial Establishments Act and Factories Act).
+
+Regenerate them with:
+
+```bash
+pip install reportlab
 python generate_sample_docs.py
 ```
 
----
+## Safety posture
 
-## Current Limitations
+Uploaded document text is treated as **untrusted input**. The system prompt instructs Gemma 4 to return strict JSON only, and the analyser:
 
-- **Scanned PDFs** - Images embedded in PDFs are not OCR'd; only selectable text is extracted
-- **Complex layouts** - Documents with multi-column layouts, headers, footers, or form fields may extract text with formatting issues
-- **Non-English originals** - Employment documents originally in Indian languages may not extract cleanly
-- **Handwritten documents** - Not supported; must be typed/printed
-- **Real mode availability** - Requires active Hugging Face API token and internet connection
-- **Language support** - Limited to English, Hindi, Marathi, Tamil, Telugu (can be extended)
-- **Tone & nuance** - Gemma 4 analysis reflects model capabilities; human review for legal decisions is always recommended
+1. Rejects any response that does not start with `{` and end with `}`.
+2. Rejects any response whose JSON does not exactly match the 9-field schema.
+3. Falls back to the mock analyser with `confidence_level: Low` and a clearly labelled source whenever validation fails.
 
----
+Additional protections:
 
-## Project Structure
+- No PII (employee names, IDs) is echoed into the prompt beyond the extracted text the user themselves uploaded.
+- Statutory deductions are handled as key points by design; they never trigger a high-risk flag.
+- API keys, base URLs, and provider details are never rendered in the UI.
+- A confidence level is surfaced on every analysis; low confidence prompts the user toward manual review.
 
-```
-Sahaayak-AI-Gemma4/
+## Current limitations
+
+- Multi-page PDFs are capped at 4 pages for the vision path to keep latency reasonable; longer documents still extract all page text, but only the first 4 pages are shown to the vision encoder.
+- `local_language_summary` quality depends on Gemma 4's coverage of the target language. The ones tested in this repo (English, Hindi, Telugu) come back as fluent native-script output.
+- The labor-law knowledge base is **informational, not legal advice**. Entries are paraphrases of well-established statutes maintained in `services/labor_law.py`; they are meant to ground Gemma's analysis, not to replace a qualified employment lawyer.
+- Function calling is currently wired only for the local Ollama provider. The HF Router provider ignores the tool loop and runs the single-shot analysis path.
+- Handwritten documents are not supported.
+
+## Project structure
+
+```text
+.
 ├── app.py                              # Streamlit frontend
 ├── generate_sample_docs.py             # Create demo PDFs
 ├── requirements.txt                    # Dependencies
 ├── pytest.ini                          # Test configuration
 ├── README.md                           # This file
-├── PROJECT_DESIGN.md                   # Detailed design document
-├── .gitignore                          # Git exclusions
+├── PROJECT_DESIGN.md                   # Design notes and build status
 ├── prompts/
-│   └── document_analysis_prompt.txt    # Gemma system prompt
+│   └── document_analysis_prompt.txt    # Strict-JSON Gemma 4 contract
 ├── services/
 │   ├── __init__.py
-│   ├── analyzer.py                     # Mock + real model logic
-│   ├── gemma_client.py                 # Hugging Face Router API client
-│   └── prompt_loader.py                # Prompt template rendering
-├── sample_docs/                        # Anonymized demo documents
-├── tests/
-│   ├── conftest.py                     # pytest fixtures
-│   ├── test_analyzer.py                # Analyzer tests
-│   ├── test_gemma_client.py            # Model client tests
-│   ├── test_prompt_loader.py           # Prompt rendering tests
-│   ├── test_extraction_and_app_helpers.py  # App helper tests
-│   └── fixtures/
-│       └── document_cases.json         # Test corpus
-└── outputs/                            # Analysis results (user-generated)
+│   ├── analyzer.py                     # Mock + real orchestration, validation, fallback
+│   ├── gemma_client.py                 # Ollama and HF Router clients
+│   └── prompt_loader.py                # Template renderer
+├── sample_docs/                        # Anonymised demo documents
+└── tests/
+    ├── conftest.py
+    ├── fixtures/document_cases.json    # Positive / negative / gibberish / canary corpus
+    ├── test_analyzer.py
+    ├── test_extraction_and_app_helpers.py
+    ├── test_gemma_client.py
+    └── test_prompt_loader.py
 ```
-
----
 
 ## Troubleshooting
 
-**"Connection lost" error on file upload:**
-Restart Streamlit to pick up configuration:
-```bash
-.venv\Scripts\python.exe -m streamlit run app.py
-```
+**Ollama not found after install on macOS** — open `/Applications/Ollama.app` once to start the background service and register `/usr/local/bin/ollama` on PATH.
 
-**Tesseract OCR not found (for image extraction):**
-Install Tesseract from: https://github.com/UB-Mannheim/tesseract/wiki
+**`Model mode` stays grey on `mock` in the sidebar** — export `MODEL_MODE=real` in the same shell before launching Streamlit.
 
-**Model timeout in real mode:**
-Increase timeout (default 60s):
-```powershell
-$env:GEMMA_TIMEOUT_SECONDS="120"
-```
+**Streamlit shows `fallback_after_model_failure`** — Gemma returned something the validator rejected. Check the terminal for the underlying error; the mock response is still safe to display.
 
-**Mock analyzer returns low confidence:**
-This is expected for complex or non-standard documents. Real mode with Gemma 4 may provide better results.
-
----
-
-## Features
-
-- ✅ Upload PDF or image employment documents
-- ✅ Extract text via PyMuPDF (PDFs) and pytesseract (OCR)
-- ✅ Multi-language support (EN, HI, MR, TA, TE)
-- ✅ Structured analysis with 9 output fields
-- ✅ Risk detection (bond clauses, long hours, penalties, etc.)
-- ✅ Statutory deduction awareness
-- ✅ Mock mode (always available) + Real mode (Gemma 4)
-- ✅ Safe fallback on model failure
-- ✅ Strict JSON schema validation
-- ✅ Comprehensive test suite
-- ✅ Anonymized sample documents
-
----
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/your-feature`)
-3. Add tests for new functionality
-4. Commit with clear messages (`git commit -m "Add feature"`)
-5. Push to your fork and open a Pull Request
-
----
-
-## License
-
-This project is open source and available under the MIT License.
-
----
+**Tesseract not found for image upload** — Tesseract is no longer required. Image uploads go straight to Gemma 4's vision path.
 
 ## Disclaimer
 
-Sahaayak AI provides informational analysis only and is not a substitute for professional legal or HR advice. Always consult qualified professionals before making employment-related decisions. Use at your own risk.
+Sahaayak AI provides informational analysis only and is not a substitute for professional legal or HR advice. Always consult a qualified professional before making employment-related decisions.
 
----
+## License
 
-## Contact & Feedback
-
-Have questions or suggestions? Please open an issue on GitHub or reach out to the maintainers.
-
-## Analyzer Output Schema
-
-The analyzer returns JSON with these fields:
-
-```json
-{
-  "document_type": "string",
-  "simple_explanation": "string",
-  "key_points": ["string"],
-  "risk_flags": [
-    {
-      "risk_title": "string",
-      "risk_explanation": "string",
-      "severity": "High | Medium | Low",
-      "source_text": "string",
-      "suggested_action": "string"
-    }
-  ],
-  "next_actions": ["string"],
-  "questions_to_ask": ["string"],
-  "source_references": ["string"],
-  "local_language_summary": "string",
-  "confidence_level": "High | Medium | Low"
-}
-```
-
-## Project Structure
-
-```text
-.
-+-- app.py
-+-- requirements.txt
-+-- README.md
-+-- prompts/
-+-- services/
-+-- sample_docs/
-+-- outputs/
-+-- tests/
-```
-
-## Run Locally
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Streamlit will print a local URL, usually `http://localhost:8501`.
-
-## Model Setup
-
-The analyzer supports two modes:
-
-- `MODEL_MODE=mock`: default. Uses the tested local heuristic analyzer.
-- `MODEL_MODE=real`: calls Gemma through API/cloud mode, parses strict JSON, validates the schema, and falls back to the mock analyzer if anything fails.
-
-### Mock Mode
-
-```powershell
-$env:MODEL_MODE="mock"
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-### Real Mode With Hugging Face Router
-
-Real mode uses the OpenAI-compatible Hugging Face Router API. Set `HF_TOKEN` and use the Gemma model route:
-
-```powershell
-$env:MODEL_MODE="real"
-$env:GEMMA_PROVIDER="api"
-$env:GEMMA_MODEL="google/gemma-4-31B-it:novita"
-$env:GEMMA_API_BASE_URL="https://router.huggingface.co/v1"
-$env:HF_TOKEN="your-huggingface-token"
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-`GEMMA_API_KEY` can be used instead of `HF_TOKEN` if preferred.
-
-The sidebar shows the active model mode. Real mode still uses the mock analyzer as a safe fallback when the provider call fails, returns malformed JSON, adds extra text, or violates the schema.
-
-This project is now API/cloud-first for real model mode. Local Ollama is not the recommended path.
-
-The analysis output also shows a small debug source label:
-
-- `mock_analyzer`
-- `gemma_real`
-- `fallback_after_model_failure`
-
-The app does not display raw prompts, API keys, or provider secrets.
-
-### Cleaning Local Model Data
-
-After the API/cloud path is confirmed working and the analysis source shows `gemma_real`, local downloaded model data can be removed separately. Do this only after confirming you no longer need local models.
-
-For Ollama, typical cleanup is:
-
-```powershell
-ollama list
-ollama rm <model-name>
-```
-
-Model files may also live under the user-level Ollama model directory. Deleting those files is destructive, so verify the API mode works first.
-
-## Troubleshooting
-
-If the browser says `Connection lost` during upload, restart Streamlit so it picks up the project config in `.streamlit/config.toml`. That config disables Streamlit usage statistics, which avoids permission errors when Windows blocks writes to the user-level `.streamlit` folder.
-
-```powershell
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-## Run Tests
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-The test suite includes unit tests for extraction, prompt loading, analyzer validation, unreadable/unsupported document handling, statutory deduction handling, and a fixture corpus covering positive, negative, gibberish, and canary documents.
-
-## OCR Setup
-
-PDF text extraction works through the Python dependency `PyMuPDF`.
-
-Image text extraction uses `pytesseract`, which also requires the Tesseract OCR engine to be installed on your machine and available on `PATH`. If the engine is missing, the app will still run and will show a clear OCR setup warning for image uploads.
-
-## Analysis Pipeline
-
-- `services/prompt_loader.py` loads and renders prompt templates from `prompts/`.
-- `prompts/document_analysis_prompt.txt` defines the strict Gemma 4 JSON contract.
-- `services/gemma_client.py` reads model environment variables and calls the configured API/cloud provider.
-- `services/analyzer.py` switches between mock and real model mode, parses strict JSON, validates schema, and falls back safely.
-- `app.py` renders the validated analyzer JSON as Streamlit cards.
-
-## Design Doc
-
-See `PROJECT_DESIGN.md` for the project design, architecture, current build status, limitations, and next steps.
-
-## Extending Later
-
-The `generate_gemma_response()` function in `services/gemma_client.py` is the provider boundary for real Gemma calls. A production implementation can add:
-
-- Provider-specific authentication or SDK support.
-- Real translation/local language output.
-- Saved analysis outputs in `outputs/`.
-- Example files in `sample_docs/`.
+MIT.
